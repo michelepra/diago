@@ -750,12 +750,15 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 
 	DefaultLogger().Debug("Remote Codecs Update", "local", s.Codecs, "remote", codecs)
 
+	// Codecs are matched by encoding (see codecsMatch) and the remote
+	// definition is kept: it carries the payload type chosen by the offerer
+	// and the remote format parameters.
 	// Some systems may like to answer with local order of preference
 	if SDPCodecPreferLocalOrder > 0 && answerer {
 		filter := make([]Codec, 0, len(codecs))
 		for _, rc := range s.Codecs {
 			for _, c := range codecs {
-				if c == rc {
+				if codecsMatch(rc, c) {
 					filter = append(filter, c)
 					break
 				}
@@ -768,8 +771,8 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 	filter := codecs[:0] // reuse buffer
 	for _, rc := range codecs {
 		for _, c := range s.Codecs {
-			if c == rc {
-				filter = append(filter, c)
+			if codecsMatch(c, rc) {
+				filter = append(filter, rc)
 				break
 			}
 		}
@@ -1194,23 +1197,25 @@ func generateSDPForAudio(sessionID uint64, sessionVersion uint64, rtpProfile str
 	fmts := make([]string, len(codecs))
 	formatsMap := []string{}
 	for i, f := range codecs {
-		// TODO should we just go generic
-		switch f.PayloadType {
-		case CodecAudioUlaw.PayloadType:
+		switch {
+		case f.PayloadType == CodecAudioUlaw.PayloadType:
 			formatsMap = append(formatsMap, "a=rtpmap:0 PCMU/8000")
-		case CodecAudioAlaw.PayloadType:
+		case f.PayloadType == CodecAudioAlaw.PayloadType:
 			formatsMap = append(formatsMap, "a=rtpmap:8 PCMA/8000")
-		case CodecAudioOpus.PayloadType:
-			formatsMap = append(formatsMap, "a=rtpmap:96 opus/48000/2")
+		case strings.EqualFold(f.Name, CodecAudioOpus.Name):
+			formatsMap = append(formatsMap, fmt.Sprintf("a=rtpmap:%d opus/48000/2", f.PayloadType))
 			// Providing 0 when FEC cannot be used on the receiving side is RECOMMENDED.
 			// https://datatracker.ietf.org/doc/html/rfc7587
-			formatsMap = append(formatsMap, "a=fmtp:96 useinbandfec=0")
-		case CodecTelephoneEvent8000.PayloadType:
-			formatsMap = append(formatsMap, "a=rtpmap:101 telephone-event/8000")
-			formatsMap = append(formatsMap, "a=fmtp:101 0-16")
+			formatsMap = append(formatsMap, fmt.Sprintf("a=fmtp:%d useinbandfec=0", f.PayloadType))
+		case strings.EqualFold(f.Name, CodecTelephoneEvent8000.Name):
+			formatsMap = append(formatsMap, fmt.Sprintf("a=rtpmap:%d telephone-event/%d", f.PayloadType, f.SampleRate))
+			formatsMap = append(formatsMap, fmt.Sprintf("a=fmtp:%d 0-16", f.PayloadType))
 		default:
 			s := fmt.Sprintf("a=rtpmap:%d %s/%d/%d", f.PayloadType, f.Name, f.SampleRate, f.NumChannels)
 			formatsMap = append(formatsMap, s)
+			if f.Fmtp != "" {
+				formatsMap = append(formatsMap, fmt.Sprintf("a=fmtp:%d %s", f.PayloadType, f.Fmtp))
+			}
 		}
 		fmts[i] = strconv.Itoa(int(f.PayloadType))
 	}
