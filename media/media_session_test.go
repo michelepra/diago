@@ -184,11 +184,14 @@ a=sendrecv`
 	err := m.RemoteSDP([]byte(sd))
 	require.NoError(t, err)
 
+	// The negotiated codecs keep the remote format parameters.
+	telephoneEvent := CodecTelephoneEvent8000
+	telephoneEvent.Fmtp = "0-16"
 	require.Len(t, m.filterCodecs, 4)
 	assert.Equal(t, CodecAudioUlaw, m.filterCodecs[0])
 	assert.Equal(t, CodecAudioAlaw, m.filterCodecs[1])
 	assert.Equal(t, CodecAudioOpus, m.filterCodecs[2])
-	assert.Equal(t, CodecTelephoneEvent8000, m.filterCodecs[3])
+	assert.Equal(t, telephoneEvent, m.filterCodecs[3])
 
 	lsdp := m.LocalSDP()
 	lsd := sdp.SessionDescription{}
@@ -220,7 +223,7 @@ a=sendrecv`
 		require.Len(t, m.filterCodecs, 3)
 		assert.Equal(t, CodecAudioUlaw, m.filterCodecs[0])
 		assert.Equal(t, CodecAudioOpus, m.filterCodecs[1])
-		assert.Equal(t, CodecTelephoneEvent8000, m.filterCodecs[2])
+		assert.Equal(t, telephoneEvent, m.filterCodecs[2])
 	}
 }
 

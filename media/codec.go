@@ -28,10 +28,43 @@ type Codec struct {
 	SampleRate  uint32
 	SampleDur   time.Duration
 	NumChannels int // 1 or 2
+	// Fmtp holds the format parameters of the codec (the value of
+	// a=fmtp:<payload type>), for example "octet-align=1" for AMR-WB.
+	// It is parsed from remote SDP and written to local SDP.
+	Fmtp string
 }
 
 func (c *Codec) String() string {
-	return fmt.Sprintf("name=%s pt=%d rate=%d dur=%s channels=%d", c.Name, c.PayloadType, c.SampleRate, c.SampleDur.String(), c.NumChannels)
+	return fmt.Sprintf("name=%s pt=%d rate=%d dur=%s channels=%d fmtp=%s", c.Name, c.PayloadType, c.SampleRate, c.SampleDur.String(), c.NumChannels, c.Fmtp)
+}
+
+// staticAudioCodecs are the RFC 3551 static payload types that an SDP may
+// list without an a=rtpmap attribute.
+var staticAudioCodecs = map[string]Codec{
+	"0":  CodecAudioUlaw,
+	"8":  CodecAudioAlaw,
+	"9":  {PayloadType: 9, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "G722"},
+	"18": {PayloadType: 18, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Name: "G729"},
+}
+
+// codecsMatch reports whether a remote codec is the same encoding as a local
+// one. Encodings are compared by name, clock rate and channels so that a
+// dynamic payload type may differ between the two sides (RFC 3264 lets the
+// offerer choose it); codecs without a name fall back to the payload type.
+func codecsMatch(local, remote Codec) bool {
+	if local.Name == "" || remote.Name == "" {
+		return local.PayloadType == remote.PayloadType
+	}
+	return strings.EqualFold(local.Name, remote.Name) &&
+		local.SampleRate == remote.SampleRate &&
+		codecChannels(local) == codecChannels(remote)
+}
+
+func codecChannels(c Codec) int {
+	if c.NumChannels <= 0 {
+		return 1
+	}
+	return c.NumChannels
 }
 
 // SampleTimestamp returns number of samples as RTP Timestamp measure
@@ -145,14 +178,8 @@ func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (i
 	n := 0
 	var rerr error
 	for _, f := range formats {
-		if f == "0" {
-			codecsAudio[n] = CodecAudioUlaw
-			n++
-			continue
-		}
-
-		if f == "8" {
-			codecsAudio[n] = CodecAudioAlaw
+		if f == "0" || f == "8" {
+			codecsAudio[n] = staticAudioCodecs[f]
 			n++
 			continue
 		}
@@ -164,6 +191,7 @@ func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (i
 		}
 		pt := uint8(pt64)
 
+		found := false
 		for _, a := range attrs {
 			// a=rtpmap:<payload type> <encoding name>/<clock rate> [/<encoding parameters>]
 			pref := "rtpmap:" + f + " "
@@ -202,10 +230,28 @@ func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (i
 						codec.NumChannels = int(numChannels)
 					}
 				}
+				codec.Fmtp = formatParameters(f, attrs)
 				codecsAudio[n] = codec
 				n++
+				found = true
 			}
+		}
+		if static, ok := staticAudioCodecs[f]; ok && !found {
+			static.Fmtp = formatParameters(f, attrs)
+			codecsAudio[n] = static
+			n++
 		}
 	}
 	return n, nil
+}
+
+// formatParameters returns the value of a=fmtp:<format>, or "" if absent.
+func formatParameters(format string, attrs []string) string {
+	pref := "fmtp:" + format + " "
+	for _, a := range attrs {
+		if strings.HasPrefix(a, pref) {
+			return strings.TrimSpace(a[len(pref):])
+		}
+	}
+	return ""
 }
