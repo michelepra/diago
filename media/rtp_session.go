@@ -300,19 +300,10 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 		// We expect that SSRC only changed but MULTI RTP stream per one session is not supported
 		// NOTE: Reading codecs may be in a race while establishing session but it is expected
 		// that caller should not run reading while session is established
-		codec := sess.Codecs[0]
-		if codec.PayloadType != readPkt.PayloadType {
-			for _, c := range sess.Codecs {
-				if c.PayloadType == readPkt.PayloadType {
-					codec = c
-					break
-				}
-			}
-
-			if codec.PayloadType != readPkt.PayloadType {
-				DefaultLogger().Warn("Received RTP with unsupported payload_type", "pt", readPkt.PayloadType)
-				return 0, nil
-			}
+		codec, supported := sess.codecByPayloadType(readPkt.PayloadType)
+		if !supported {
+			DefaultLogger().Warn("Received RTP with unsupported payload_type", "pt", readPkt.PayloadType)
+			return 0, nil
 		}
 
 		*stats = RTPReadStats{
@@ -357,6 +348,27 @@ func (s *RTPSession) ReadRTP(b []byte, readPkt *rtp.Packet) (n int, err error) {
 	// stats.lastRTPTimestamp = readPkt.Timestamp
 
 	return n, err
+}
+
+func codecByPayloadType(codecs []Codec, payloadType uint8) (Codec, bool) {
+	for _, codec := range codecs {
+		if codec.PayloadType == payloadType {
+			return codec, true
+		}
+	}
+	return Codec{}, false
+}
+
+// codecByPayloadType resolves an RTP payload type to a codec of this session.
+// After negotiation the payload types in use are those of the negotiated
+// codecs, which carry the offerer's numbers and can differ from the local
+// ones (RFC 3264 section 6.1). Local codecs are still accepted, because a
+// remote answerer may keep its own payload types and expect to receive ours.
+func (s *MediaSession) codecByPayloadType(payloadType uint8) (Codec, bool) {
+	if codec, ok := codecByPayloadType(s.filterCodecs, payloadType); ok {
+		return codec, true
+	}
+	return codecByPayloadType(s.Codecs, payloadType)
 }
 
 // sourceLockProtection locks RTP handling only to one source change
@@ -407,17 +419,10 @@ func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
 	writeStats := &s.writeStats
 	// For now we only track latest SSRC
 	if writeStats.SSRC != pkt.SSRC {
-		codec, err := func() (Codec, error) {
-			// Find codec from promoted list of codecs
-			for _, c := range sess.Codecs {
-				if c.PayloadType == pkt.PayloadType {
-					return c, nil
-				}
-			}
-			return Codec{}, fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
-		}()
-		if err != nil {
-			return err
+		codec, ok := sess.codecByPayloadType(pkt.PayloadType)
+		if !ok {
+			s.rtcpMU.Unlock()
+			return fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
 		}
 
 		*writeStats = RTPWriteStats{
