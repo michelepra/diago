@@ -94,6 +94,21 @@ func CodecAudioFromSession(s *MediaSession) Codec {
 	return codec
 }
 
+// CodecTelephoneEventFromSession returns the 8 kHz telephone-event codec used
+// by the session for RFC 4733 DTMF: the negotiated one, which carries the
+// payload type agreed with the peer, otherwise the local one, otherwise
+// CodecTelephoneEvent8000.
+func CodecTelephoneEventFromSession(s *MediaSession) Codec {
+	for _, codecs := range [][]Codec{s.filterCodecs, s.Codecs} {
+		for _, codec := range codecs {
+			if strings.EqualFold(codec.Name, CodecTelephoneEvent8000.Name) && codec.SampleRate == CodecTelephoneEvent8000.SampleRate {
+				return codec
+			}
+		}
+	}
+	return CodecTelephoneEvent8000
+}
+
 // IsAuxiliary reports whether c is an auxiliary RTP format (RFC 4733 events,
 // RFC 3389 comfort noise) carried beside the audio rather than decoded as it.
 func (c Codec) IsAuxiliary() bool {
@@ -196,6 +211,11 @@ func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (i
 		pt64, err := strconv.ParseUint(f, 10, 8)
 		if err != nil {
 			rerr = errors.Join(rerr, fmt.Errorf("format type failed to conv to integer, skipping f=%s: %w", f, err))
+			continue
+		}
+		// RTP payload types are 7 bits (RFC 3550).
+		if pt64 > 127 {
+			rerr = errors.Join(rerr, fmt.Errorf("payload type %d is out of the RTP range 0-127, skipping", pt64))
 			continue
 		}
 		pt := uint8(pt64)

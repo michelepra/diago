@@ -301,7 +301,7 @@ func (s *RTPSession) updateReadStats(readPkt *rtp.Packet, n int, now time.Time) 
 
 	sampleRate := stats.SampleRate
 	if ssrcChanged || !stats.payloadTypeKnown || stats.payloadType != readPkt.PayloadType {
-		codec, supported := codecByPayloadType(s.Sess.Codecs, readPkt.PayloadType)
+		codec, supported := s.Sess.codecByPayloadType(readPkt.PayloadType)
 		if !supported {
 			return false
 		}
@@ -370,6 +370,18 @@ func codecByPayloadType(codecs []Codec, payloadType uint8) (Codec, bool) {
 	return Codec{}, false
 }
 
+// codecByPayloadType resolves an RTP payload type to a codec of this session.
+// After negotiation the payload types in use are those of the negotiated
+// codecs, which carry the offerer's numbers and can differ from the local
+// ones (RFC 3264 section 6.1). Local codecs are still accepted, because a
+// remote answerer may keep its own payload types and expect to receive ours.
+func (s *MediaSession) codecByPayloadType(payloadType uint8) (Codec, bool) {
+	if codec, ok := codecByPayloadType(s.filterCodecs, payloadType); ok {
+		return codec, true
+	}
+	return codecByPayloadType(s.Codecs, payloadType)
+}
+
 // sourceLockProtection locks RTP handling only to one source change
 func (s *RTPSession) sourceLockProtection(pkt *rtp.Packet, from net.Addr) bool {
 	// TODO: Consider handling flood RTP protection
@@ -418,17 +430,10 @@ func (s *RTPSession) WriteRTP(pkt *rtp.Packet) error {
 	writeStats := &s.writeStats
 	// For now we only track latest SSRC
 	if writeStats.SSRC != pkt.SSRC {
-		codec, err := func() (Codec, error) {
-			// Find codec from promoted list of codecs
-			for _, c := range sess.Codecs {
-				if c.PayloadType == pkt.PayloadType {
-					return c, nil
-				}
-			}
-			return Codec{}, fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
-		}()
-		if err != nil {
-			return err
+		codec, ok := sess.codecByPayloadType(pkt.PayloadType)
+		if !ok {
+			s.rtcpMU.Unlock()
+			return fmt.Errorf("unknown media codec used for payload type=%d", pkt.PayloadType)
 		}
 
 		*writeStats = RTPWriteStats{
