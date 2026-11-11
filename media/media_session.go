@@ -791,11 +791,12 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 	// Some systems may like to answer with local order of preference
 	if SDPCodecPreferLocalOrder > 0 && answerer {
 		filter := make([]Codec, 0, len(codecs))
-		used := make([]bool, len(codecs))
 		for _, c := range s.Codecs {
-			if i := matchingCodec(codecs, c, used); i >= 0 {
-				used[i] = true
-				filter = append(filter, c.negotiate(codecs[i], answerer))
+			for _, rc := range codecs {
+				if c.Matches(rc) {
+					filter = append(filter, c.negotiate(rc, answerer))
+					break
+				}
 			}
 		}
 		s.filterCodecs = filter
@@ -804,8 +805,11 @@ func (s *MediaSession) updateRemoteCodecs(codecs []Codec, answerer bool) int {
 
 	filter := codecs[:0] // reuse buffer
 	for _, rc := range codecs {
-		if i := matchingCodec(s.Codecs, rc, nil); i >= 0 {
-			filter = append(filter, s.Codecs[i].negotiate(rc, answerer))
+		for _, c := range s.Codecs {
+			if c.Matches(rc) {
+				filter = append(filter, c.negotiate(rc, answerer))
+				break
+			}
 		}
 	}
 	s.filterCodecs = filter

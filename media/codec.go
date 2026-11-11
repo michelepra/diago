@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emiago/diago/media/sdp"
@@ -29,6 +30,49 @@ var (
 	CodecComfortNoise8000 = Codec{PayloadType: 13, SampleRate: 8000, NumChannels: 1, Name: "cn"}
 )
 
+// CodecFmtpMatcher reports whether two fmtp values (the value of
+// a=fmtp:<payload type>, "" if absent) of the same encoding select the same RTP
+// payload format. Codecs whose format parameters do not match are not
+// negotiated. It must be symmetric and should compare only parameters that
+// change the payload format, not negotiable ones (e.g. Opus useinbandfec,
+// G.729 annexb, AMR mode-set).
+type CodecFmtpMatcher func(fmtp, other CodecFmtp) bool
+
+var (
+	// formatMatchers maps lowercase encoding names to their CodecFmtpMatcher.
+	// Registrations are rare and lookups happen on every negotiation, the case
+	// sync.Map is optimized for.
+	formatMatchers sync.Map
+
+	// CodecFmtpMatcherAmr is the CodecFmtpMatcher registered by default
+	// for AMR and AMR-WB. Codecs match when they have the same octet-align, which
+	// selects the RFC 4867 payload format: 1 octet-aligned, 0 bandwidth-efficient
+	// (default when absent). Other parameters, such as mode-set, are negotiable
+	// and ignored.
+	CodecFmtpMatcherAmr CodecFmtpMatcher = func(fmtp, other CodecFmtp) bool {
+		return fmtp.GetDefault("octet-align", "0") == other.GetDefault("octet-align", "0")
+	}
+)
+
+func init() {
+	formatMatchers.Store("amr", CodecFmtpMatcherAmr)
+	formatMatchers.Store("amr-wb", CodecFmtpMatcherAmr)
+}
+
+// RegisterCodecFmtpMatcher sets the CodecFmtpMatcher used by Codec.Matches for the
+// encoding name (case-insensitive, as in a=rtpmap), replacing the previous one,
+// built-in matchers for AMR and AMR-WB included. A nil matcher removes the
+// registration. Encodings without a matcher match regardless of fmtp.
+// It is safe for concurrent use.
+func RegisterCodecFmtpMatcher(encoding string, match CodecFmtpMatcher) {
+	key := strings.ToLower(encoding)
+	if match == nil {
+		formatMatchers.Delete(key)
+		return
+	}
+	formatMatchers.Store(key, match)
+}
+
 type Codec struct {
 	Name        string
 	PayloadType uint8
@@ -38,9 +82,78 @@ type Codec struct {
 	// Fmtp holds the format parameters (the value of a=fmtp:<payload type>),
 	// e.g. "octet-align=1" for AMR-WB. It is parsed from remote SDP and
 	// written to local SDP. A negotiated codec carries the remote parameters.
-	Fmtp string
+	Fmtp CodecFmtp
 
 	payloadTypeRecv *uint8 // Only set for asymmetric negotiated payload mappings.
+}
+
+// CodecFmtp is the value of a=fmtp:<payload type>, e.g.
+// "octet-align=1; mode-set=0,1,2", or "" if absent.
+type CodecFmtp string
+
+func (f CodecFmtp) String() string {
+	return string(f)
+}
+
+// GetDefault returns the value of key (case-insensitive), or defaultValue if
+// key is absent.
+func (f CodecFmtp) GetDefault(key, defaultValue string) string {
+	if value, isPresent := f.Get(key); isPresent {
+		return value
+	}
+	return defaultValue
+}
+
+// Get returns the value of key (case-insensitive) and whether key is present.
+// A key without "=" is present with an empty value.
+func (f CodecFmtp) Get(key string) (string, bool) {
+	s := string(f)
+	for s != "" {
+		var param string
+		param, s, _ = strings.Cut(s, ";")
+		k, v, _ := strings.Cut(param, "=")
+		if strings.EqualFold(strings.TrimSpace(k), key) {
+			return strings.TrimSpace(v), true
+		}
+	}
+	return "", false
+}
+
+// With returns f with key set to value, replacing the first parameter with the
+// same key (case-insensitive) or appending it; f is unchanged. An empty value
+// writes the key without "=". Parameters are rewritten separated by "; ".
+func (f CodecFmtp) With(key, value string) CodecFmtp {
+	param := key
+	if value != "" {
+		param = key + "=" + value
+	}
+
+	var b strings.Builder
+	replaced := false
+	s := string(f)
+	for s != "" {
+		var p string
+		p, s, _ = strings.Cut(s, ";")
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if k, _, _ := strings.Cut(p, "="); !replaced && strings.EqualFold(strings.TrimSpace(k), key) {
+			p = param
+			replaced = true
+		}
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(p)
+	}
+	if !replaced {
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(param)
+	}
+	return CodecFmtp(b.String())
 }
 
 // PayloadTypeRecv returns the receive payload type of a negotiated codec.
@@ -65,29 +178,17 @@ func (c Codec) negotiate(remote Codec, answerer bool) Codec {
 	return c
 }
 
-// matchingCodec returns the index of the codec in codecs with the same
-// encoding as c, or -1. Among several matches (e.g. AMR-WB offered both
-// octet-aligned and bandwidth-efficient) the one with the same payload type
-// is preferred. Codecs marked in used are skipped; used may be nil.
-func matchingCodec(codecs []Codec, c Codec, used []bool) int {
-	match := -1
-	for i, candidate := range codecs {
-		if (used != nil && used[i]) || !candidate.Matches(c) {
-			continue
-		}
-		if candidate.PayloadType == c.PayloadType {
-			return i
-		}
-		if match < 0 {
-			match = i
-		}
-	}
-	return match
-}
-
-// Matches compares codec identity independently of payload type and packet duration.
+// Matches compares codec identity independently of payload type and packet
+// duration. The fmtp values must also satisfy the CodecFmtpMatcher registered for
+// the encoding (see RegisterCodecFmtpMatcher).
 func (c Codec) Matches(other Codec) bool {
-	return strings.EqualFold(c.Name, other.Name) && c.SampleRate == other.SampleRate && c.NumChannels == other.NumChannels
+	if strings.EqualFold(c.Name, other.Name) && c.SampleRate == other.SampleRate && c.NumChannels == other.NumChannels {
+		// applies the CodecFmtpMatcher registered for the encoding name.
+		matcher, fmtpMatcherIsSet := formatMatchers.Load(strings.ToLower(c.Name))
+		return !fmtpMatcherIsSet || matcher.(CodecFmtpMatcher)(c.Fmtp, other.Fmtp)
+	}
+
+	return false
 }
 
 func (c *Codec) String() string {
@@ -296,11 +397,11 @@ func CodecsFromSDPRead(formats []string, attrs []string, codecsAudio []Codec) (i
 }
 
 // formatParameters returns the value of a=fmtp:<format>, or "" if absent.
-func formatParameters(format string, attrs []string) string {
+func formatParameters(format string, attrs []string) CodecFmtp {
 	pref := "fmtp:" + format + " "
 	for _, a := range attrs {
 		if strings.HasPrefix(a, pref) {
-			return strings.TrimSpace(a[len(pref):])
+			return CodecFmtp(strings.TrimSpace(a[len(pref):]))
 		}
 	}
 	return ""

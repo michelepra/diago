@@ -56,7 +56,7 @@ func TestAnswerEchoesOfferedFmtp(t *testing.T) {
 		negotiated := CodecAudioFromSession(sess)
 		assert.Equal(t, uint8(98), negotiated.PayloadType)
 		assert.Equal(t, uint8(98), negotiated.PayloadTypeRecv())
-		assert.Equal(t, "octet-align=1; mode-set=0,1,2", negotiated.Fmtp)
+		assert.Equal(t, CodecFmtp("octet-align=1; mode-set=0,1,2"), negotiated.Fmtp)
 
 		answer := string(sess.LocalSDP(true))
 		assert.Contains(t, answer, "m=audio 1234 RTP/AVP 98\r\n")
@@ -64,18 +64,87 @@ func TestAnswerEchoesOfferedFmtp(t *testing.T) {
 	}
 }
 
-// TestOffererPairsAnswerWithSameLocalVariant checks that, with several local
-// variants of one encoding, the answer is paired with the variant on the same
-// payload type, so the receive payload type stays the offered one.
-func TestOffererPairsAnswerWithSameLocalVariant(t *testing.T) {
-	sess := fmtpSession(codecAMRWB, codecAMRWBOctet)
-	sess.LocalSDP(false)
-	require.NoError(t, sess.RemoteSDP(fmtpSDP("119", "rtpmap:119 AMR-WB/16000", "fmtp:119 octet-align=1"), true))
+// TestOctetAlignSelectsAMRWBVariant checks that octet-align, which selects the
+// RFC 4867 payload format, takes part in matching with its default 0: the
+// answer is paired with the local variant of the same format, whose payload
+// type becomes the receive one.
+func TestOctetAlignSelectsAMRWBVariant(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		local    []Codec
+		fmtp     []string
+		wantRecv uint8
+		wantErr  bool
+	}{
+		{name: "octet-aligned", local: []Codec{codecAMRWB, codecAMRWBOctet}, fmtp: []string{"fmtp:98 octet-align=1"}, wantRecv: 119},
+		{name: "explicit bandwidth-efficient", local: []Codec{codecAMRWBOctet, codecAMRWB}, fmtp: []string{"fmtp:98 octet-align=0"}, wantRecv: 118},
+		{name: "absent is bandwidth-efficient", local: []Codec{codecAMRWBOctet, codecAMRWB}, wantRecv: 118},
+		{name: "absent does not match octet-aligned", local: []Codec{codecAMRWBOctet}, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := fmtpSession(tt.local...)
+			sess.LocalSDP(false)
+			err := sess.RemoteSDP(fmtpSDP("98", append([]string{"rtpmap:98 AMR-WB/16000"}, tt.fmtp...)...), true)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			negotiated := CodecAudioFromSession(sess)
+			assert.Equal(t, uint8(98), negotiated.PayloadType)
+			assert.Equal(t, tt.wantRecv, negotiated.PayloadTypeRecv())
+		})
+	}
+}
 
-	negotiated := CodecAudioFromSession(sess)
-	assert.Equal(t, uint8(119), negotiated.PayloadType)
-	assert.Equal(t, uint8(119), negotiated.PayloadTypeRecv())
-	assert.Equal(t, "octet-align=1", negotiated.Fmtp)
+// TestRegisterCodecFmtpMatcherForUnknownEncoding checks that a matcher registered
+// for an encoding unknown to diago selects the local variant with the same
+// payload format, case-insensitively, and that removing it restores matching
+// regardless of fmtp.
+func TestRegisterCodecFmtpMatcherForUnknownEncoding(t *testing.T) {
+	RegisterCodecFmtpMatcher("x-framed", func(fmtp, other CodecFmtp) bool {
+		v, ok := fmtp.Get("framing")
+		otherV, otherOk := other.Get("framing")
+		return ok == otherOk && v == otherV
+	})
+	t.Cleanup(func() { RegisterCodecFmtpMatcher("x-framed", nil) })
+
+	framedA := Codec{Name: "X-FRAMED", PayloadType: 110, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1}
+	framedB := Codec{Name: "X-FRAMED", PayloadType: 111, SampleRate: 8000, SampleDur: 20 * time.Millisecond, NumChannels: 1, Fmtp: "framing=b"}
+	remote := fmtpSDP("98", "rtpmap:98 x-framed/8000", "fmtp:98 framing=b")
+
+	sess := fmtpSession(framedA, framedB)
+	sess.LocalSDP(false)
+	require.NoError(t, sess.RemoteSDP(remote, true))
+	assert.Equal(t, uint8(111), CodecAudioFromSession(sess).PayloadTypeRecv())
+
+	require.Error(t, fmtpSession(framedA).RemoteSDP(remote, false))
+
+	RegisterCodecFmtpMatcher("X-Framed", nil)
+	require.NoError(t, fmtpSession(framedA).RemoteSDP(remote, false))
+}
+
+func TestCodecFmtpWith(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		fmtp       CodecFmtp
+		key, value string
+		want       CodecFmtp
+	}{
+		{name: "empty", key: "octet-align", value: "1", want: "octet-align=1"},
+		{name: "append", fmtp: "mode-set=0,1,2", key: "octet-align", value: "1", want: "mode-set=0,1,2; octet-align=1"},
+		{name: "replace case-insensitive keeps order", fmtp: "Octet-Align=0;mode-set=0,1,2", key: "octet-align", value: "1", want: "octet-align=1; mode-set=0,1,2"},
+		{name: "replace only first", fmtp: "a=1; a=2", key: "a", value: "3", want: "a=3; a=2"},
+		{name: "empty value writes bare key", fmtp: "a=1;", key: "b", want: "a=1; b"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := tt.fmtp.With(tt.key, tt.value)
+			assert.Equal(t, tt.want, f)
+			v, ok := f.Get(tt.key)
+			assert.True(t, ok)
+			assert.Equal(t, tt.value, v)
+		})
+	}
 }
 
 func TestDifferentEncodingOnSamePayloadTypeDoesNotMatch(t *testing.T) {
