@@ -6,6 +6,7 @@ package diago
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"sync"
@@ -528,6 +529,23 @@ func TestDialogClientInviteFailed(t *testing.T) {
 		assert.Equal(t, "Anonymous", req.From().DisplayName)
 		assert.Equal(t, "anonymous", req.From().Address.User)
 		assert.NotEmpty(t, req.From().Params.GetOr("tag", ""))
+	})
+
+	t.Run("WithMediaSession", func(t *testing.T) {
+		sess, err := media.NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+		require.NoError(t, err)
+		amrwb := media.Codec{Name: "AMR-WB", PayloadType: 118, SampleRate: 16000, SampleDur: 20 * time.Millisecond, NumChannels: 1, FMTP: "octet-align=0"}
+		amrwbOctet := amrwb
+		amrwbOctet.PayloadType, amrwbOctet.FMTP = 119, "octet-align=1"
+		sess.Codecs = []media.Codec{amrwb, amrwbOctet}
+
+		dialog, err := dg.NewDialog(sip.Uri{User: "alice", Host: "localhost"}, NewDialogOptions{})
+		require.NoError(t, err)
+		go dialog.Invite(context.Background(), InviteClientOptions{MediaSession: sess})
+		offer := string((<-reqCh).Body())
+		assert.Contains(t, offer, fmt.Sprintf("m=audio %d RTP/AVP 118 119\r\n", sess.Laddr.Port))
+		assert.Contains(t, offer, "a=fmtp:118 octet-align=0\r\n")
+		assert.Contains(t, offer, "a=fmtp:119 octet-align=1\r\n")
 	})
 }
 

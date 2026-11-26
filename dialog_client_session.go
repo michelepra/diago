@@ -96,6 +96,13 @@ type InviteClientOptions struct {
 	// RTPNAT is media.MediaSession.RTPNAT, set before media starts
 	// Check media.RTPNAT... options
 	RTPNAT int
+
+	// MediaSession is an initialized media session to offer instead of one
+	// created from the dialog media config. It sets the codecs, RTP address,
+	// SRTP and RTPNAT of this call, so RTPNAT above is ignored.
+	// The returned DialogMedia owns it: it is closed when the dialog ends or
+	// Invite fails.
+	MediaSession *media.MediaSession
 }
 
 // WithAnonymousCaller sets from user Anonymous per RFC
@@ -138,6 +145,10 @@ func (d *DialogClientSession) Invite(ctx context.Context, opts InviteClientOptio
 	conf.rtpNAT = opts.RTPNAT
 
 	med := &DialogMedia{}
+	if opts.MediaSession != nil {
+		// initMediaSessionFromConf keeps a precreated session.
+		med.initMediaSessionUnsafe(opts.MediaSession, nil, nil)
+	}
 	if err := med.initMediaSessionFromConf(conf); err != nil {
 		return nil, err
 	}
